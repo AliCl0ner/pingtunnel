@@ -22,7 +22,17 @@ jobs:
         with:
           go-version: '1.24.1'
 
-      - name: Install dependencies
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc libc6-dev # For potential CGO requirements
+
+      - name: Clean workspace
+        run: |
+          rm -f pingtunnel
+          ls -la
+
+      - name: Install Go dependencies
         run: |
           go mod tidy || go get github.com/esrrhs/gohome@master
 
@@ -30,6 +40,7 @@ jobs:
         env:
           GOOS: linux
           GOARCH: amd64
+          CGO_ENABLED: 0 # Disable CGO unless required
         run: go build -v -o pingtunnel .
 
       - name: Make binary executable
@@ -37,6 +48,7 @@ jobs:
 
       - name: Verify binary
         run: |
+          ls -la ./pingtunnel
           file ./pingtunnel
           ./pingtunnel -h
 
