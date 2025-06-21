@@ -41,7 +41,7 @@ jobs:
           GOOS: linux
           GOARCH: amd64
           CGO_ENABLED: 0 # Disable CGO unless required
-        run: go build -v -o pingtunnel .
+        run: go build -v -o pingtunnel ./cmd/
 
       - name: Make binary executable
         run: chmod +x ./pingtunnel
