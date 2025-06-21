@@ -1,18 +1,25 @@
 package pingtunnel
 
 import (
+	"net"
+	"sync"
+	"time"
+
 	"github.com/esrrhs/gohome/common"
 	"github.com/esrrhs/gohome/loggo"
 	"github.com/esrrhs/gohome/network"
 	"github.com/esrrhs/gohome/thread"
 	"github.com/golang/protobuf/proto"
 	"golang.org/x/net/icmp"
-	"net"
-	"sync"
-	"time"
 )
 
 func NewServer(key int, maxconn int, maxprocessthread int, maxprocessbuffer int, connecttmeout int) (*Server, error) {
+	if maxprocessthread == 0 {
+		maxprocessthread = 10
+	}
+	if maxprocessbuffer == 0 {
+		maxprocessbuffer = 100
+	}
 	s := &Server{
 		exit:             false,
 		key:              key,
@@ -20,6 +27,7 @@ func NewServer(key int, maxconn int, maxprocessthread int, maxprocessbuffer int,
 		maxprocessthread: maxprocessthread,
 		maxprocessbuffer: maxprocessbuffer,
 		connecttmeout:    connecttmeout,
+		lastNetShow:      time.Now(),
 	}
 
 	if maxprocessthread > 0 {
@@ -40,6 +48,7 @@ type Server struct {
 	maxprocessthread int
 	maxprocessbuffer int
 	connecttmeout    int
+	lastNetShow      time.Time
 
 	conn *icmp.PacketConn
 
@@ -75,7 +84,6 @@ type ServerConn struct {
 }
 
 func (p *Server) Run() error {
-
 	conn, err := icmp.ListenPacket("ip4:icmp", "")
 	if err != nil {
 		loggo.Error("Error listening for ICMP packets: %s", err.Error())
@@ -83,16 +91,14 @@ func (p *Server) Run() error {
 	}
 	p.conn = conn
 
-	recv := make(chan *Packet, 10000)
+	recv := make(chan *Packet, 1000)
 	p.recvcontrol = make(chan int, 1)
 	go recvICMP(&p.workResultLock, &p.exit, *p.conn, recv)
 
 	go func() {
 		defer common.CrashLog()
-
 		p.workResultLock.Add(1)
 		defer p.workResultLock.Done()
-
 		for !p.exit {
 			p.checkTimeoutConn()
 			p.showNet()
@@ -103,10 +109,8 @@ func (p *Server) Run() error {
 
 	go func() {
 		defer common.CrashLog()
-
 		p.workResultLock.Add(1)
 		defer p.workResultLock.Done()
-
 		for !p.exit {
 			select {
 			case <-p.recvcontrol:
@@ -124,28 +128,29 @@ func (p *Server) Stop() {
 	p.exit = true
 	p.recvcontrol <- 1
 	p.workResultLock.Wait()
-	p.processtp.Stop()
+	if p.processtp != nil {
+		p.processtp.Stop()
+	}
 	p.conn.Close()
 }
 
 func (p *Server) processPacket(packet *Packet) {
-
-	if packet.my.Key != (int32)(p.key) {
+	if packet.my.Key != int32(p.key) {
 		return
 	}
 
-	if packet.my.Type == (int32)(MyMsg_PING) {
+	if packet.my.Type == int32(MyMsg_PING) {
 		t := time.Time{}
 		t.UnmarshalBinary(packet.my.Data)
 		loggo.Info("ping from %s %s %d %d %d", packet.src.String(), t.String(), packet.my.Rproto, packet.echoId, packet.echoSeq)
-		sendICMP(packet.echoId, packet.echoSeq, *p.conn, packet.src, "", "", (uint32)(MyMsg_PING), packet.my.Data,
-			(int)(packet.my.Rproto), -1, p.key,
+		sendICMP(packet.echoId, packet.echoSeq, *p.conn, packet.src, "", "", uint32(MyMsg_PING), packet.my.Data,
+			int(packet.my.Rproto), -1, p.key,
 			0, 0, 0, 0, 0, 0,
 			0)
 		return
 	}
 
-	if packet.my.Type == (int32)(MyMsg_KICK) {
+	if packet.my.Type == int32(MyMsg_KICK) {
 		localConn := p.getServerConnById(packet.my.Id)
 		if localConn != nil {
 			p.close(localConn)
@@ -155,83 +160,71 @@ func (p *Server) processPacket(packet *Packet) {
 	}
 
 	if p.maxprocessthread > 0 {
-		p.processtp.AddJob((int)(common.HashString(packet.my.Id)), packet)
+		p.processtp.AddJob(int(common.HashString(packet.my.Id)), packet)
 	} else {
 		p.processDataPacket(packet)
 	}
 }
 
 func (p *Server) processDataPacketNewConn(id string, packet *Packet) *ServerConn {
-
 	now := common.GetNowUpdateInSecond()
-
-	loggo.Info("start add new connect  %s %s", id, packet.my.Target)
+	loggo.Info("start add new connect %s %s", id, packet.my.Target)
 
 	if p.maxconn > 0 && p.localConnMapSize >= p.maxconn {
 		loggo.Info("too many connections %d, server connected target fail %s", p.localConnMapSize, packet.my.Target)
-		p.remoteError(packet.echoId, packet.echoSeq, id, (int)(packet.my.Rproto), packet.src)
+		p.remoteError(packet.echoId, packet.echoSeq, id, int(packet.my.Rproto), packet.src)
 		return nil
 	}
 
 	addr := packet.my.Target
 	if p.isConnError(addr) {
 		loggo.Info("addr connect Error before: %s %s", id, addr)
-		p.remoteError(packet.echoId, packet.echoSeq, id, (int)(packet.my.Rproto), packet.src)
+		p.remoteError(packet.echoId, packet.echoSeq, id, int(packet.my.Rproto), packet.src)
 		return nil
 	}
 
 	if packet.my.Tcpmode > 0 {
-
 		c, err := net.DialTimeout("tcp", addr, time.Millisecond*time.Duration(p.connecttmeout))
 		if err != nil {
 			loggo.Error("Error listening for tcp packets: %s %s", id, err.Error())
-			p.remoteError(packet.echoId, packet.echoSeq, id, (int)(packet.my.Rproto), packet.src)
+			p.remoteError(packet.echoId, packet.echoSeq, id, int(packet.my.Rproto), packet.src)
 			p.addConnError(addr)
 			return nil
 		}
 		targetConn := c.(*net.TCPConn)
 		ipaddrTarget := targetConn.RemoteAddr().(*net.TCPAddr)
 
-		fm := network.NewFrameMgr(FRAME_MAX_SIZE, FRAME_MAX_ID, (int)(packet.my.TcpmodeBuffersize), (int)(packet.my.TcpmodeMaxwin), (int)(packet.my.TcpmodeResendTimems), (int)(packet.my.TcpmodeCompress),
-			(int)(packet.my.TcpmodeStat))
+		fm := network.NewFrameMgr(FRAME_MAX_SIZE, FRAME_MAX_ID, int(packet.my.TcpmodeBuffersize), int(packet.my.TcpmodeMaxwin), int(packet.my.TcpmodeResendTimems), int(packet.my.TcpmodeCompress),
+			int(packet.my.TcpmodeStat))
 
-		localConn := &ServerConn{exit: false, timeout: (int)(packet.my.Timeout), tcpconn: targetConn, tcpaddrTarget: ipaddrTarget, id: id, activeRecvTime: now, activeSendTime: now, close: false,
-			rproto: (int)(packet.my.Rproto), fm: fm, tcpmode: (int)(packet.my.Tcpmode)}
+		localConn := &ServerConn{exit: false, timeout: int(packet.my.Timeout), tcpconn: targetConn, tcpaddrTarget: ipaddrTarget, id: id, activeRecvTime: now, activeSendTime: now, close: false,
+			rproto: int(packet.my.Rproto), fm: fm, tcpmode: int(packet.my.Tcpmode), echoId: packet.echoId, echoSeq: packet.echoSeq}
 
 		p.addServerConn(id, localConn)
-
 		go p.RecvTCP(localConn, id, packet.src)
 		return localConn
-
 	} else {
-
 		c, err := net.DialTimeout("udp", addr, time.Millisecond*time.Duration(p.connecttmeout))
 		if err != nil {
 			loggo.Error("Error listening for udp packets: %s %s", id, err.Error())
-			p.remoteError(packet.echoId, packet.echoSeq, id, (int)(packet.my.Rproto), packet.src)
+			p.remoteError(packet.echoId, packet.echoSeq, id, int(packet.my.Rproto), packet.src)
 			p.addConnError(addr)
 			return nil
 		}
 		targetConn := c.(*net.UDPConn)
 		ipaddrTarget := targetConn.RemoteAddr().(*net.UDPAddr)
 
-		localConn := &ServerConn{exit: false, timeout: (int)(packet.my.Timeout), conn: targetConn, ipaddrTarget: ipaddrTarget, id: id, activeRecvTime: now, activeSendTime: now, close: false,
-			rproto: (int)(packet.my.Rproto), tcpmode: (int)(packet.my.Tcpmode)}
+		localConn := &ServerConn{exit: false, timeout: int(packet.my.Timeout), conn: targetConn, ipaddrTarget: ipaddrTarget, id: id, activeRecvTime: now, activeSendTime: now, close: false,
+			rproto: int(packet.my.Rproto), tcpmode: int(packet.my.Tcpmode), echoId: packet.echoId, echoSeq: packet.echoSeq}
 
 		p.addServerConn(id, localConn)
-
 		go p.Recv(localConn, id, packet.src)
-
 		return localConn
 	}
-
-	return nil
 }
 
 func (p *Server) processDataPacket(packet *Packet) {
-
 	loggo.Debug("processPacket %s %s %d", packet.my.Id, packet.src.String(), len(packet.my.Data))
-
 	now := common.GetNowUpdateInSecond()
 
 	id := packet.my.Id
@@ -247,66 +240,62 @@ func (p *Server) processDataPacket(packet *Packet) {
 	localConn.echoId = packet.echoId
 	localConn.echoSeq = packet.echoSeq
 
-	if packet.my.Type == (int32)(MyMsg_DATA) {
-
+	if packet.my.Type == int32(MyMsg_DATA) {
 		if packet.my.Tcpmode > 0 {
 			f := &network.Frame{}
-			err := proto.Unmarshal(packet.my.Data, f)
-			if err != nil {
-				loggo.Error("Unmarshal tcp Error %s", err)
+			if err := proto.Unmarshal(packet.my.Data, f); err != nil {
+				loggo.Warn("Unmarshal tcp Error %s", err)
 				return
 			}
-
 			localConn.fm.OnRecvFrame(f)
-
 		} else {
 			if packet.my.Data == nil {
 				return
 			}
-			_, err := localConn.conn.Write(packet.my.Data)
-			if err != nil {
-				loggo.Info("WriteToUDP Error %s", err)
+			if _, err := localConn.conn.Write(packet.my.Data); err != nil {
+				loggo.Warn("WriteToUDP Error %s", err)
 				localConn.close = true
 				return
 			}
 		}
-
 		p.recvPacket++
-		p.recvPacketSize += (uint64)(len(packet.my.Data))
+		p.recvPacketSize += uint64(len(packet.my.Data))
 	}
 }
 
 func (p *Server) RecvTCP(conn *ServerConn, id string, src *net.IPAddr) {
-
 	defer common.CrashLog()
-
 	p.workResultLock.Add(1)
 	defer p.workResultLock.Done()
 
 	loggo.Info("server waiting target response %s -> %s %s", conn.tcpaddrTarget.String(), conn.id, conn.tcpconn.LocalAddr().String())
-
 	loggo.Info("start wait remote connect tcp %s %s", conn.id, conn.tcpaddrTarget.String())
+
 	startConnectTime := common.GetNowUpdateInSecond()
 	for !p.exit && !conn.exit {
 		if conn.fm.IsConnected() {
 			break
 		}
 		conn.fm.Update()
-		sendlist := conn.fm.GetSendList()
-		for e := sendlist.Front(); e != nil; e = e.Next() {
-			f := e.Value.(*network.Frame)
-			mb, _ := conn.fm.MarshalFrame(f)
-			sendICMP(conn.echoId, conn.echoSeq, *p.conn, src, "", id, (uint32)(MyMsg_DATA), mb,
-				conn.rproto, -1, p.key,
-				0, 0, 0, 0, 0, 0,
-				0)
-			p.sendPacket++
-			p.sendPacketSize += (uint64)(len(mb))
+		if sendlist := conn.fm.GetSendList(); sendlist.Len() > 0 {
+			var batch [][]byte
+			for e := sendlist.Front(); e != nil; e = e.Next() {
+				f := e.Value.(*network.Frame)
+				if mb, err := conn.fm.MarshalFrame(f); err == nil {
+					batch = append(batch, mb)
+				}
+			}
+			if len(batch) > 0 {
+				for _, mb := range batch {
+					sendICMP(conn.echoId, conn.echoSeq, *p.conn, src, "", id, uint32(MyMsg_DATA), mb,
+						conn.rproto, -1, p.key, 0, 0, 0, 0, 0, 0, 0)
+					p.sendPacket++
+					p.sendPacketSize += uint64(len(mb))
+				}
+			}
 		}
 		time.Sleep(time.Millisecond * 10)
-		now := common.GetNowUpdateInSecond()
-		diffclose := now.Sub(startConnectTime)
-		if diffclose > time.Second*5 {
+		if now := common.GetNowUpdateInSecond(); now.Sub(startConnectTime) > time.Second*5 {
 			loggo.Info("can not connect remote tcp %s %s", conn.id, conn.tcpaddrTarget.String())
 			p.close(conn)
 			p.remoteError(conn.echoId, conn.echoSeq, id, conn.rproto, src)
@@ -318,10 +307,8 @@ func (p *Server) RecvTCP(conn *ServerConn, id string, src *net.IPAddr) {
 		loggo.Info("remote connected tcp %s %s", conn.id, conn.tcpaddrTarget.String())
 	}
 
-	bytes := make([]byte, 10240)
-
-	tcpActiveRecvTime := common.GetNowUpdateInSecond()
-	tcpActiveSendTime := common.GetNowUpdateInSecond()
+	bytes := bufferPool.Get().([]byte)
+	defer bufferPool.Put(bytes)
 
 	for !p.exit && !conn.exit {
 		now := common.GetNowUpdateInSecond()
@@ -329,12 +316,12 @@ func (p *Server) RecvTCP(conn *ServerConn, id string, src *net.IPAddr) {
 
 		left := common.MinOfInt(conn.fm.GetSendBufferLeft(), len(bytes))
 		if left > 0 {
-			conn.tcpconn.SetReadDeadline(time.Now().Add(time.Millisecond * 1))
-			n, err := conn.tcpconn.Read(bytes[0:left])
+			conn.tcpconn.SetReadDeadline(time.Now().Add(time.Millisecond * 10))
+			n, err := conn.tcpconn.Read(bytes[:left])
 			if err != nil {
 				nerr, ok := err.(net.Error)
 				if !ok || !nerr.Timeout() {
-					loggo.Info("Error read tcp %s %s %s", conn.id, conn.tcpaddrTarget.String(), err)
+					loggo.Warn("Error read tcp %s %s %s", conn.id, conn.tcpaddrTarget.String(), err)
 					conn.fm.Close()
 					break
 				}
@@ -342,91 +329,79 @@ func (p *Server) RecvTCP(conn *ServerConn, id string, src *net.IPAddr) {
 			if n > 0 {
 				sleep = false
 				conn.fm.WriteSendBuffer(bytes[:n])
-				tcpActiveRecvTime = now
+				conn.activeRecvTime = now
 			}
 		}
 
 		conn.fm.Update()
-
-		sendlist := conn.fm.GetSendList()
-		if sendlist.Len() > 0 {
+		if sendlist := conn.fm.GetSendList(); sendlist.Len() > 0 {
 			sleep = false
 			conn.activeSendTime = now
+			var batch [][]byte
 			for e := sendlist.Front(); e != nil; e = e.Next() {
 				f := e.Value.(*network.Frame)
-				mb, err := conn.fm.MarshalFrame(f)
-				if err != nil {
-					loggo.Error("Error tcp Marshal %s %s %s", conn.id, conn.tcpaddrTarget.String(), err)
-					continue
+				if mb, err := conn.fm.MarshalFrame(f); err == nil {
+					batch = append(batch, mb)
 				}
-				sendICMP(conn.echoId, conn.echoSeq, *p.conn, src, "", id, (uint32)(MyMsg_DATA), mb,
-					conn.rproto, -1, p.key,
-					0, 0, 0, 0, 0, 0,
-					0)
+			}
+			for _, mb := range batch {
+				sendICMP(conn.echoId, conn.echoSeq, *p.conn, src, "", id, uint32(MyMsg_DATA), mb,
+					conn.rproto, -1, p.key, 0, 0, 0, 0, 0, 0, 0)
 				p.sendPacket++
-				p.sendPacketSize += (uint64)(len(mb))
+				p.sendPacketSize += uint64(len(mb))
 			}
 		}
 
 		if conn.fm.GetRecvBufferSize() > 0 {
 			sleep = false
 			rr := conn.fm.GetRecvReadLineBuffer()
-			conn.tcpconn.SetWriteDeadline(time.Now().Add(time.Millisecond * 1))
+			conn.tcpconn.SetWriteDeadline(time.Now().Add(time.Millisecond * 10))
 			n, err := conn.tcpconn.Write(rr)
 			if err != nil {
 				nerr, ok := err.(net.Error)
 				if !ok || !nerr.Timeout() {
-					loggo.Info("Error write tcp %s %s %s", conn.id, conn.tcpaddrTarget.String(), err)
+					loggo.Warn("Error write tcp %s %s %s", conn.id, conn.tcpaddrTarget.String(), err)
 					conn.fm.Close()
 					break
 				}
 			}
 			if n > 0 {
 				conn.fm.SkipRecvBuffer(n)
-				tcpActiveSendTime = now
+				conn.activeSendTime = now
 			}
 		}
 
 		if sleep {
-			time.Sleep(time.Millisecond * 10)
+			time.Sleep(time.Millisecond * 20)
 		}
 
-		diffrecv := now.Sub(conn.activeRecvTime)
-		diffsend := now.Sub(conn.activeSendTime)
-		tcpdiffrecv := now.Sub(tcpActiveRecvTime)
-		tcpdiffsend := now.Sub(tcpActiveSendTime)
-		if diffrecv > time.Second*(time.Duration(conn.timeout)) || diffsend > time.Second*(time.Duration(conn.timeout)) ||
-			(tcpdiffrecv > time.Second*(time.Duration(conn.timeout)) && tcpdiffsend > time.Second*(time.Duration(conn.timeout))) {
+		if diff := now.Sub(conn.activeRecvTime); diff > time.Second*time.Duration(conn.timeout) {
 			loggo.Info("close inactive conn %s %s", conn.id, conn.tcpaddrTarget.String())
-			conn.fm.Close()
-			break
-		}
-
-		if conn.fm.IsRemoteClosed() {
-			loggo.Info("closed by remote conn %s %s", conn.id, conn.tcpaddrTarget.String())
 			conn.fm.Close()
 			break
 		}
 	}
 
 	conn.fm.Close()
-
 	startCloseTime := common.GetNowUpdateInSecond()
 	for !p.exit && !conn.exit {
 		now := common.GetNowUpdateInSecond()
 
 		conn.fm.Update()
-
-		sendlist := conn.fm.GetSendList()
-		for e := sendlist.Front(); e != nil; e = e.Next() {
-			f := e.Value.(*network.Frame)
-			mb, _ := conn.fm.MarshalFrame(f)
-			sendICMP(conn.echoId, conn.echoSeq, *p.conn, src, "", id, (uint32)(MyMsg_DATA), mb,
-				conn.rproto, -1, p.key,
-				0, 0, 0, 0, 0, 0,
-				0)
-			p.sendPacket++
-			p.sendPacketSize += (uint64)(len(mb))
+		if sendlist := conn.fm.GetSendList(); sendlist.Len() > 0 {
+			var batch [][]byte
+			for e := sendlist.Front(); e != nil; e = e.Next() {
+				f := e.Value.(*network.Frame)
+				if mb, err := conn.fm.MarshalFrame(f); err == nil {
+					batch = append(batch, mb)
+				}
+			}
+			for _, mb := range batch {
+				sendICMP(conn.echoId, conn.echoSeq, *p.conn, src, "", id, uint32(MyMsg_DATA), mb,
+					conn.rproto, -1, p.key, 0, 0, 0, 0, 0, 0, 0)
+				p.sendPacket++
+				p.sendPacketSize += uint64(len(mb))
+			}
 		}
 
 		nodatarecv := true
@@ -456,45 +431,40 @@ func (p *Server) RecvTCP(conn *ServerConn, id string, src *net.IPAddr) {
 	}
 
 	time.Sleep(time.Second)
-
 	loggo.Info("close tcp conn %s %s", conn.id, conn.tcpaddrTarget.String())
 	p.close(conn)
 }
 
 func (p *Server) Recv(conn *ServerConn, id string, src *net.IPAddr) {
-
 	defer common.CrashLog()
-
 	p.workResultLock.Add(1)
 	defer p.workResultLock.Done()
 
 	loggo.Info("server waiting target response %s -> %s %s", conn.ipaddrTarget.String(), conn.id, conn.conn.LocalAddr().String())
 
-	bytes := make([]byte, 2000)
+	bytes := bufferPool.Get().([]byte)
+	defer bufferPool.Put(bytes)
 
 	for !p.exit {
-
 		conn.conn.SetReadDeadline(time.Now().Add(time.Millisecond * 100))
 		n, _, err := conn.conn.ReadFromUDP(bytes)
 		if err != nil {
 			nerr, ok := err.(net.Error)
 			if !ok || !nerr.Timeout() {
-				loggo.Info("ReadFromUDP Error read udp %s", err)
+				loggo.Warn("ReadFromUDP Error read udp %s", err)
 				conn.close = true
 				return
 			}
 		}
 
-		now := common.GetNowUpdateInSecond()
-		conn.activeSendTime = now
-
-		sendICMP(conn.echoId, conn.echoSeq, *p.conn, src, "", id, (uint32)(MyMsg_DATA), bytes[:n],
-			conn.rproto, -1, p.key,
-			0, 0, 0, 0, 0, 0,
-			0)
-
-		p.sendPacket++
-		p.sendPacketSize += (uint64)(n)
+		if n > 0 {
+			now := common.GetNowUpdateInSecond()
+			conn.activeSendTime = now
+			sendICMP(conn.echoId, conn.echoSeq, *p.conn, src, "", id, uint32(MyMsg_DATA), bytes[:n],
+				conn.rproto, -1, p.key, 0, 0, 0, 0, 0, 0, 0)
+			p.sendPacket++
+			p.sendPacketSize += uint64(n)
+		}
 	}
 }
 
@@ -512,7 +482,6 @@ func (p *Server) close(conn *ServerConn) {
 }
 
 func (p *Server) checkTimeoutConn() {
-
 	tmp := make(map[string]*ServerConn)
 	p.localConnMap.Range(func(key, value interface{}) bool {
 		id := key.(string)
@@ -528,7 +497,7 @@ func (p *Server) checkTimeoutConn() {
 		}
 		diffrecv := now.Sub(conn.activeRecvTime)
 		diffsend := now.Sub(conn.activeSendTime)
-		if diffrecv > time.Second*(time.Duration(conn.timeout)) || diffsend > time.Second*(time.Duration(conn.timeout)) {
+		if diffrecv > time.Second*time.Duration(conn.timeout) || diffsend > time.Second*time.Duration(conn.timeout) {
 			conn.close = true
 		}
 	}
@@ -545,13 +514,17 @@ func (p *Server) checkTimeoutConn() {
 }
 
 func (p *Server) showNet() {
+	if time.Since(p.lastNetShow) < 5*time.Second {
+		return
+	}
+	p.lastNetShow = time.Now()
 	p.localConnMapSize = 0
 	p.localConnMap.Range(func(key, value interface{}) bool {
 		p.localConnMapSize++
 		return true
 	})
 	loggo.Info("send %dPacket/s %dKB/s recv %dPacket/s %dKB/s %dConnections",
-		p.sendPacket, p.sendPacketSize/1024, p.recvPacket, p.recvPacketSize/1024, p.localConnMapSize)
+		p.sendPacket/5, p.sendPacketSize/(1024*5), p.recvPacket/5, p.recvPacketSize/(1024*5), p.localConnMapSize)
 	p.sendPacket = 0
 	p.recvPacket = 0
 	p.sendPacketSize = 0
@@ -575,7 +548,7 @@ func (p *Server) deleteServerConn(uuid string) {
 }
 
 func (p *Server) remoteError(echoId int, echoSeq int, uuid string, rprpto int, src *net.IPAddr) {
-	sendICMP(echoId, echoSeq, *p.conn, src, "", uuid, (uint32)(MyMsg_KICK), []byte{},
+	sendICMP(echoId, echoSeq, *p.conn, src, "", uuid, uint32(MyMsg_KICK), []byte{},
 		rprpto, -1, p.key,
 		0, 0, 0, 0, 0, 0,
 		0)
@@ -595,7 +568,6 @@ func (p *Server) isConnError(addr string) bool {
 }
 
 func (p *Server) updateConnError() {
-
 	tmp := make(map[string]time.Time)
 	p.connErrorMap.Range(func(key, value interface{}) bool {
 		id := key.(string)

@@ -3,15 +3,16 @@ package main
 import (
 	"flag"
 	"fmt"
-	"github.com/esrrhs/gohome/common"
-	"github.com/esrrhs/gohome/loggo"
-	"github.com/esrrhs/gohome/thirdparty"
-	"github.com/esrrhs/pingtunnel"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"strconv"
 	"time"
+
+	"github.com/esrrhs/gohome/common"
+	"github.com/esrrhs/gohome/loggo"
+	"github.com/esrrhs/gohome/thirdparty"
+	"github.com/esrrhs/pingtunnel"
 )
 
 var usage = `
@@ -40,8 +41,8 @@ Usage:
     -key      设置的纯数字密码，默认0, 参数为int类型，范围从0-2147483647，不可夹杂字母特殊符号
               Set password, default 0
 
-    -nolog    不写日志文件，只打印标准输出，默认0
-              Do not write log files, only print standard output, default 0 is off
+    -nolog    不写日志文件，只打印标准输出，默认1
+              Do not write log files, only print standard output, default 1 is on
 
     -noprint  不打印屏幕输出，默认0
               Do not print standard output, default 0 is off
@@ -49,14 +50,14 @@ Usage:
     -loglevel 日志文件等级，默认info
               log level, default is info
 
-    -maxconn  最大连接数，默认0，不受限制
-              the max num of connections, default 0 is no limit
+    -maxconn  最大连接数，默认100
+              the max num of connections, default 100
 
-    -maxprt   server最大处理线程数，默认100
-              max process thread in server, default 100
+    -maxprt   server最大处理线程数，默认10
+              max process thread in server, default 10
 
-    -maxprb   server最大处理线程buffer数，默认1000
-              max process thread's buffer in server, default 1000
+    -maxprb   server最大处理线程buffer数，默认100
+              max process thread's buffer in server, default 100
 
     -conntt   server发起连接到目标地址的超时时间，默认1000ms
               The timeout period for the server to initiate a connection to the destination address. The default is 1000ms.
@@ -81,11 +82,11 @@ Usage:
     -tcp      设置是否转发tcp，默认0
               Set the switch to forward tcp, the default is 0
 
-    -tcp_bs   tcp的发送接收缓冲区大小，默认1MB
-              Tcp send and receive buffer size, default 1MB
+    -tcp_bs   tcp的发送接收缓冲区大小，默认256KB
+              Tcp send and receive buffer size, default 256KB
 
-    -tcp_mw   tcp的最大窗口，默认20000
-              The maximum window of tcp, the default is 20000
+    -tcp_mw   tcp的最大窗口，默认5000
+              The maximum window of tcp, the default is 5000
 
     -tcp_rst  tcp的超时发送时间，默认400ms
               Tcp timeout resend time, default 400ms
@@ -96,8 +97,8 @@ Usage:
     -tcp_stat 打印tcp的监控，默认0
               Print tcp connection statistic, default 0 is off
 
-    -nolog    不写日志文件，只打印标准输出，默认0
-              Do not write log files, only print standard output, default 0 is off
+    -nolog    不写日志文件，只打印标准输出，默认1
+              Do not write log files, only print standard output, default 1 is on
 
     -noprint  不打印屏幕输出，默认0
               Do not print standard output, default 0 is off
@@ -119,7 +120,6 @@ Usage:
 `
 
 func main() {
-
 	defer common.CrashLog()
 
 	t := flag.String("type", "", "client or server")
@@ -129,18 +129,18 @@ func main() {
 	timeout := flag.Int("timeout", 60, "conn timeout")
 	key := flag.Int("key", 0, "key")
 	tcpmode := flag.Int("tcp", 0, "tcp mode")
-	tcpmode_buffersize := flag.Int("tcp_bs", 1*1024*1024, "tcp mode buffer size")
-	tcpmode_maxwin := flag.Int("tcp_mw", 20000, "tcp mode max win")
+	tcpmode_buffersize := flag.Int("tcp_bs", 256*1024, "tcp mode buffer size")
+	tcpmode_maxwin := flag.Int("tcp_mw", 5000, "tcp mode max win")
 	tcpmode_resend_timems := flag.Int("tcp_rst", 400, "tcp mode resend time ms")
 	tcpmode_compress := flag.Int("tcp_gz", 0, "tcp data compress")
-	nolog := flag.Int("nolog", 0, "write log file")
+	nolog := flag.Int("nolog", 1, "write log file")
 	noprint := flag.Int("noprint", 0, "print stdout")
 	tcpmode_stat := flag.Int("tcp_stat", 0, "print tcp stat")
 	loglevel := flag.String("loglevel", "info", "log level")
 	open_sock5 := flag.Int("sock5", 0, "sock5 mode")
-	maxconn := flag.Int("maxconn", 0, "max num of connections")
-	max_process_thread := flag.Int("maxprt", 100, "max process thread in server")
-	max_process_buffer := flag.Int("maxprb", 1000, "max process thread's buffer in server")
+	maxconn := flag.Int("maxconn", 100, "max num of connections")
+	max_process_thread := flag.Int("maxprt", 10, "max process thread in server")
+	max_process_buffer := flag.Int("maxprb", 100, "max process thread's buffer in server")
 	profile := flag.Int("profile", 0, "open profile")
 	conntt := flag.Int("conntt", 1000, "the connect call's timeout")
 	s5filter := flag.String("s5filter", "", "sock5 filter")
@@ -168,8 +168,12 @@ func main() {
 			*tcpmode = 1
 		}
 	}
+	if *tcpmode_buffersize > 1024*1024 {
+		fmt.Println("tcp buffer size too large, max = 1MB")
+		return
+	}
 	if *tcpmode_maxwin*10 > pingtunnel.FRAME_MAX_ID {
-		fmt.Println("set tcp win to big, max = " + strconv.Itoa(pingtunnel.FRAME_MAX_ID/10))
+		fmt.Println("set tcp win too big, max = " + strconv.Itoa(pingtunnel.FRAME_MAX_ID/10))
 		return
 	}
 
@@ -200,7 +204,6 @@ func main() {
 			return
 		}
 	} else if *t == "client" {
-
 		loggo.Info("type %s", *t)
 		loggo.Info("listen %s", *listen)
 		loggo.Info("server %s", *server)
@@ -255,8 +258,6 @@ func main() {
 			loggo.Error("Run ERROR: %s", err.Error())
 			return
 		}
-	} else {
-		return
 	}
 
 	if *profile > 0 {

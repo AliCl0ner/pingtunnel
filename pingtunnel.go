@@ -2,15 +2,22 @@ package pingtunnel
 
 import (
 	"encoding/binary"
+	"net"
+	"sync"
+	"time"
+
 	"github.com/esrrhs/gohome/common"
 	"github.com/esrrhs/gohome/loggo"
 	"github.com/golang/protobuf/proto"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
-	"net"
-	"sync"
-	"time"
 )
+
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 2048)
+	},
+}
 
 func sendICMP(id int, sequence int, conn icmp.PacketConn, server *net.IPAddr, target string,
 	connId string, msgType uint32, data []byte, sproto int, rproto int, key int,
@@ -19,19 +26,19 @@ func sendICMP(id int, sequence int, conn icmp.PacketConn, server *net.IPAddr, ta
 
 	m := &MyMsg{
 		Id:                  connId,
-		Type:                (int32)(msgType),
+		Type:                int32(msgType),
 		Target:              target,
 		Data:                data,
-		Rproto:              (int32)(rproto),
-		Key:                 (int32)(key),
-		Tcpmode:             (int32)(tcpmode),
-		TcpmodeBuffersize:   (int32)(tcpmode_buffer_size),
-		TcpmodeMaxwin:       (int32)(tcpmode_maxwin),
-		TcpmodeResendTimems: (int32)(tcpmode_resend_time),
-		TcpmodeCompress:     (int32)(tcpmode_compress),
-		TcpmodeStat:         (int32)(tcpmode_stat),
-		Timeout:             (int32)(timeout),
-		Magic:               (int32)(MyMsg_MAGIC),
+		Rproto:              int32(rproto),
+		Key:                 int32(key),
+		Tcpmode:             int32(tcpmode),
+		TcpmodeBuffersize:   int32(tcpmode_buffer_size),
+		TcpmodeMaxwin:       int32(tcpmode_maxwin),
+		TcpmodeResendTimems: int32(tcpmode_resend_time),
+		TcpmodeCompress:     int32(tcpmode_compress),
+		TcpmodeStat:         int32(tcpmode_stat),
+		Timeout:             int32(timeout),
+		Magic:               int32(MyMsg_MAGIC),
 	}
 
 	mb, err := proto.Marshal(m)
@@ -47,7 +54,7 @@ func sendICMP(id int, sequence int, conn icmp.PacketConn, server *net.IPAddr, ta
 	}
 
 	msg := &icmp.Message{
-		Type: (ipv4.ICMPType)(sproto),
+		Type: ipv4.ICMPType(sproto),
 		Code: 0,
 		Body: body,
 	}
@@ -62,26 +69,27 @@ func sendICMP(id int, sequence int, conn icmp.PacketConn, server *net.IPAddr, ta
 }
 
 func recvICMP(workResultLock *sync.WaitGroup, exit *bool, conn icmp.PacketConn, recv chan<- *Packet) {
-
 	defer common.CrashLog()
 
-	(*workResultLock).Add(1)
-	defer (*workResultLock).Done()
+	workResultLock.Add(1)
+	defer workResultLock.Done()
 
-	bytes := make([]byte, 10240)
 	for !*exit {
+		bytes := bufferPool.Get().([]byte)
 		conn.SetReadDeadline(time.Now().Add(time.Millisecond * 100))
 		n, srcaddr, err := conn.ReadFrom(bytes)
 
 		if err != nil {
 			nerr, ok := err.(net.Error)
 			if !ok || !nerr.Timeout() {
-				loggo.Info("Error read icmp message %s", err)
-				continue
+				loggo.Error("Error read icmp message %s", err)
 			}
+			bufferPool.Put(bytes)
+			continue
 		}
 
 		if n <= 0 {
+			bufferPool.Put(bytes)
 			continue
 		}
 
@@ -91,18 +99,19 @@ func recvICMP(workResultLock *sync.WaitGroup, exit *bool, conn icmp.PacketConn, 
 		my := &MyMsg{}
 		err = proto.Unmarshal(bytes[8:n], my)
 		if err != nil {
-			loggo.Debug("Unmarshal MyMsg error: %s", err)
+			loggo.Warn("Unmarshal MyMsg error: %s", err)
+			bufferPool.Put(bytes)
 			continue
 		}
 
-		if my.Magic != (int32)(MyMsg_MAGIC) {
-			loggo.Debug("processPacket data invalid %s", my.Id)
+		if my.Magic != int32(MyMsg_MAGIC) {
+			loggo.Warn("processPacket data invalid %s", my.Id)
+			bufferPool.Put(bytes)
 			continue
 		}
 
-		recv <- &Packet{my: my,
-			src:    srcaddr.(*net.IPAddr),
-			echoId: echoId, echoSeq: echoSeq}
+		recv <- &Packet{my: my, src: srcaddr.(*net.IPAddr), echoId: echoId, echoSeq: echoSeq}
+		bufferPool.Put(bytes)
 	}
 }
 
@@ -114,6 +123,6 @@ type Packet struct {
 }
 
 const (
-	FRAME_MAX_SIZE int = 888
-	FRAME_MAX_ID   int = 1000000
+	FRAME_MAX_SIZE = 888
+	FRAME_MAX_ID   = 1000000
 )
