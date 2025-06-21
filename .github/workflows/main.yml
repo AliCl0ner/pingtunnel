@@ -7,7 +7,7 @@ on:
   pull_request:
     branches:
       - main
-  workflow_dispatch: # Add this to enable manual runs
+  workflow_dispatch: # Enables manual runs via Run workflow button
 
 jobs:
   build:
@@ -23,13 +23,17 @@ jobs:
           go-version: '1.24.1'
 
       - name: Install dependencies
-        run: go mod tidy
+        run: |
+          go mod tidy || go get github.com/esrrhs/gohome@master
 
       - name: Build for Ubuntu amd64
         env:
           GOOS: linux
           GOARCH: amd64
         run: go build -v -o pingtunnel .
+
+      - name: Make binary executable
+        run: chmod +x ./pingtunnel
 
       - name: Verify binary
         run: |
